@@ -1,7 +1,7 @@
 # luarocks-build-builtin-hook
 
-[![test](https://github.com/mah0x211/lua-luarocks-build-builtin-hook/actions/workflows/test.yml/badge.svg)](https://github.com/mah0x211/lua-luarocks-build-builtin-hook/actions/workflows/test.yml)
-[![codecov](https://codecov.io/gh/mah0x211/lua-luarocks-build-builtin-hook/branch/master/graph/badge.svg)](https://codecov.io/gh/mah0x211/lua-luarocks-build-builtin-hook)
+[![test](https://github.com/mah0x211/luarocks-build-builtin-hook/actions/workflows/test.yml/badge.svg)](https://github.com/mah0x211/luarocks-build-builtin-hook/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/mah0x211/luarocks-build-builtin-hook/branch/master/graph/badge.svg)](https://codecov.io/gh/mah0x211/luarocks-build-builtin-hook)
 
 
 A custom build backend for LuaRocks that extends the standard `builtin` backend with support for executing Lua scripts before and after the build process.
