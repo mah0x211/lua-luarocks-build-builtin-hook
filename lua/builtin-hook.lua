@@ -1,3 +1,24 @@
+--
+-- Copyright (C) 2026 Masatoshi Fukunaga
+--
+-- Permission is hereby granted, free of charge, to any person obtaining a copy
+-- of this software and associated documentation files (the "Software"), to deal
+-- in the Software without restriction, including without limitation the rights
+-- to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-- copies of the Software, and to permit persons to whom the Software is
+-- furnished to do so, subject to the following conditions:
+--
+-- The above copyright notice and this permission notice shall be included in
+-- all copies or substantial portions of the Software.
+--
+-- THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-- IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-- FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+-- AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-- LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-- OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+-- THE SOFTWARE.
+--
 local builtin = require("luarocks.build.builtin")
 local fs = require("luarocks.fs")
 local util = require("luarocks.util")
@@ -89,6 +110,32 @@ local function load_hook(hook_file, env)
     return chunk, err
 end
 
+local function execute_builtin_hook(hook_file, rockspec)
+    local whole, name = hook_file:match("^(%s*%$%(([^)%s]*))")
+    if not whole then
+        return false -- Not a submodule attempt
+    elseif not hook_file:find("^%)%s*$", #whole + 1) then
+        return nil, "Invalid submodule syntax"
+    elseif #name == 0 then
+        return nil, "Invalid submodule syntax: missing name"
+    end
+
+    -- Load as submodule via require
+    local ok, mod = pcall(require, "luarocks.build.builtin-hook." .. name)
+    if not ok then
+        return nil, ("Failed to load submodule %s: %s"):format(name, mod)
+    end
+
+    -- Execute the submodule
+    local run_ok, run_err = pcall(mod, rockspec)
+    if not run_ok then
+        return nil, ("Failed to run submodule %s: %s"):format(name, run_err or
+                                                                  "unknown error")
+    end
+
+    return true
+end
+
 local function execute_hook(rockspec, name)
     local build = rockspec.build
     local hook_file = build[name]
@@ -96,6 +143,15 @@ local function execute_hook(rockspec, name)
         return true
     end
 
+    -- try to execute as builtin hook
+    local ok, err = execute_builtin_hook(hook_file, rockspec)
+    if err then
+        return nil, err
+    elseif ok then
+        return true
+    end
+
+    -- Load as file
     if not fs.exists(hook_file) then
         return nil, "Hook script not found: " .. hook_file
     end
@@ -103,14 +159,14 @@ local function execute_hook(rockspec, name)
     util.printout("Running hook: " .. hook_file)
 
     local env = getenv()
-    local chunk, err = load_hook(hook_file, env)
+    local chunk, load_err = load_hook(hook_file, env)
     if not chunk then
-        return nil,
-               "Failed to load " .. name .. ": " .. (err or "unknown error")
+        return nil, "Failed to load " .. name .. ": " ..
+                   (load_err or "unknown error")
     end
 
-    local ok, run_err = pcall(chunk, rockspec)
-    if not ok then
+    local run_ok, run_err = pcall(chunk, rockspec)
+    if not run_ok then
         return nil,
                "Failed to run " .. name .. ": " .. (run_err or "unknown error")
     end

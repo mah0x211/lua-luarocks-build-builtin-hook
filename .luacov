@@ -1,6 +1,7 @@
 codefromstrings = false
 runreport = true
-deletestats = false
+deletestats = true
 modules = {
     ["luarocks.build.builtin-hook"] = "lua/builtin-hook.lua",
+    ["luarocks.build.builtin-hook.pkgconfig"] = "lua/hooks/pkgconfig.lua",
 }
