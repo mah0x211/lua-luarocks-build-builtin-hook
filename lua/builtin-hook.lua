@@ -19,6 +19,8 @@
 -- OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 -- THE SOFTWARE.
 --
+local concat = table.concat
+local unpack = unpack or table.unpack
 local builtin = require("luarocks.build.builtin")
 local fs = require("luarocks.fs")
 local util = require("luarocks.util")
@@ -97,87 +99,174 @@ local function getenv()
     return env
 end
 
-local function load_hook(hook_file, env)
+--- Load a hook file as a chunk.
+--- @param pathname string The hook file path.
+--- @return function? chunk fn The loaded chunk, or nil on failure.
+--- @return any err An error message on failure.
+local function load_hook(pathname)
+    -- Load as file
+    if not fs.exists(pathname) then
+        return nil, ("%q hook script not found"):format(pathname)
+    end
+
+    local env = getenv()
     local chunk, err
     if _G.setfenv then
-        chunk, err = loadfile(hook_file)
+        chunk, err = loadfile(pathname)
         if chunk then
             _G.setfenv(chunk, env)
         end
     else
-        chunk, err = loadfile(hook_file, "bt", env) -- luacheck: no max line length
+        chunk, err = loadfile(pathname, "bt", env)
     end
-    return chunk, err
+
+    if err then
+        return nil, ("Failed to load hook script %q: %s"):format(pathname, err)
+    end
+    return chunk
 end
 
-local function execute_builtin_hook(hook_file, rockspec)
-    local whole, name = hook_file:match("^(%s*%$%(([^)%s]*))")
+--- Load a builtin hook module from its name.
+--- @param pathname string The hook string to parse.
+--- @return function? fn The loaded module, or nil on failure.
+--- @return any err An error message on failure.
+local function load_builtin_hook(pathname)
+    local whole, name = pathname:match("^(%s*%$%(([^)%s]*))")
     if not whole then
-        return false -- Not a submodule attempt
-    elseif not hook_file:find("^%)%s*$", #whole + 1) then
-        return nil, "Invalid submodule syntax"
+        -- Not a builtin hook attempt
+        return
+    elseif not pathname:find("^%)%s*$", #whole + 1) then
+        return nil, "Invalid builtin hook syntax"
     elseif #name == 0 then
-        return nil, "Invalid submodule syntax: missing name"
+        return nil, "Invalid builtin hook syntax: missing name"
     end
 
-    -- Load as submodule via require
+    -- Load hook as submodule via require
     local ok, mod = pcall(require, "luarocks.build.builtin-hook." .. name)
     if not ok then
-        return nil, ("Failed to load submodule %s: %s"):format(name, mod)
+        return nil, ("Failed to load builtin-hook %s: %s"):format(name, mod)
+    elseif type(mod) ~= "function" then
+        return nil, ("Invalid builtin-hook %s: not a function"):format(name)
     end
-
-    -- Execute the submodule
-    local run_ok, run_err = pcall(mod, rockspec)
-    if not run_ok then
-        return nil, ("Failed to run submodule %s: %s"):format(name, run_err or
-                                                                  "unknown error")
-    end
-
-    return true
+    return mod
 end
 
-local function execute_hook(rockspec, name)
-    local build = rockspec.build
-    local hook_file = build[name]
-    if not hook_file then
-        return true
+--- @class builtin.hook
+--- @field spec_name string The name of the hook in the rockspec.
+--- @field value string The original hook string.
+--- @field pathname string The hook file path.
+--- @field args string[] The arguments to pass to the hook
+--- @field func function The loaded hook function.
+
+--- Parse a hook string into its components.
+--- @param str string The hook string to parse.
+--- @return builtin.hook? hook The parsed hook
+--- @return any err An error message on failure.
+local function parse_hook(str)
+    local hook = {
+        args = {},
+    }
+    for match in str:gmatch('([^%s]+)') do
+        hook.args[#hook.args + 1] = match
+    end
+    -- Reconstruct original hook string
+    hook.value = concat(hook.args, " ")
+    -- First argument is the hook pathname
+    hook.pathname = table.remove(hook.args, 1)
+
+    -- Try to load as builtin hook
+    local err
+    hook.func, err = load_builtin_hook(hook.pathname)
+    if not err and not hook.func then
+        -- Load as script file
+        hook.func, err = load_hook(hook.pathname)
     end
 
-    -- try to execute as builtin hook
-    local ok, err = execute_builtin_hook(hook_file, rockspec)
     if err then
+        -- Failed to load as builtin hook
         return nil, err
-    elseif ok then
-        return true
+    end
+    return hook
+end
+
+local function parse_hooks(rockspec, name)
+    local spec_key = 'build.' .. name
+    local build = rockspec.build
+    local hooks = build[name]
+    if not hooks then
+        return {} -- no hooks
     end
 
-    -- Load as file
-    if not fs.exists(hook_file) then
-        return nil, "Hook script not found: " .. hook_file
+    local is_array = false
+    local hook_type = type(hooks)
+    if hook_type == 'string' then
+        hooks = {
+            build[name],
+        }
+    elseif hook_type ~= 'table' then
+        return nil, "Invalid hook type: " .. hook_type
+    elseif #hooks == 0 then
+        return {} -- no hooks
+    else
+        is_array = true
+        -- confirm it's an array of strings
+        local nhooks = #hooks
+        local count = 0
+        for _, v in pairs(hooks) do
+            count = count + 1
+            if count > nhooks or type(v) ~= "string" then
+                return nil, ("%s must be an array of strings"):format(spec_key)
+            end
+        end
     end
 
-    util.printout("Running hook: " .. hook_file)
+    -- parse hooks
+    for i, str in ipairs(hooks) do
+        local idx = is_array and ("#%d"):format(i) or ""
+        local t = type(str)
+        if t ~= 'string' then
+            return nil, ("%s%s must be a string: %s"):format(spec_key, idx, t)
+        end
 
-    local env = getenv()
-    local chunk, load_err = load_hook(hook_file, env)
-    if not chunk then
-        return nil, "Failed to load " .. name .. ": " ..
-                   (load_err or "unknown error")
+        -- parse hook string
+        local hook, err = parse_hook(str)
+        if err then
+            return nil, ("%s%s: %s"):format(spec_key, idx, err)
+        end
+        hook.spec_name = ("%s%s"):format(spec_key, idx)
+        hooks[i] = hook
     end
 
-    local run_ok, run_err = pcall(chunk, rockspec)
-    if not run_ok then
-        return nil,
-               "Failed to run " .. name .. ": " .. (run_err or "unknown error")
-    end
-    return true
+    return hooks
+end
+
+local function run_hook(hook, rockspec)
+    return xpcall(function()
+        hook.func(rockspec, unpack(hook.args))
+    end, debug.traceback)
 end
 
 local function run(rockspec, no_install)
-    -- 1. Run before_build if present
-    local ok, err = execute_hook(rockspec, "before_build")
-    if not ok then
+    local before_hooks, after_hooks, err
+
+    -- Parse before_build hooks
+    before_hooks, err = parse_hooks(rockspec, "before_build")
+    if not before_hooks then
         return nil, err
+    end
+    after_hooks, err = parse_hooks(rockspec, "after_build")
+    if not after_hooks then
+        return nil, err
+    end
+
+    -- 1. Run before_build if present
+    local ok
+    for _, hook in ipairs(before_hooks) do
+        util.printout("Running hook: " .. hook.value)
+        ok, err = run_hook(hook, rockspec)
+        if not ok then
+            return false, ("Failed to run %q: %s"):format(hook.spec_name, err)
+        end
     end
 
     -- 2. Delegate to standard builtin backend
@@ -187,9 +276,12 @@ local function run(rockspec, no_install)
     end
 
     -- 3. Run after_build if present
-    ok, err = execute_hook(rockspec, "after_build")
-    if not ok then
-        return nil, err
+    for _, hook in ipairs(after_hooks) do
+        util.printout("Running hook: " .. hook.value)
+        ok, err = run_hook(hook, rockspec)
+        if not ok then
+            return false, ("Failed to run %q: %s"):format(hook.spec_name, err)
+        end
     end
 
     return true
