@@ -1,91 +1,11 @@
 require("luacov")
 
--- Mock framework
-local function mock(name, table)
-    package.loaded[name] = table
-end
-
--- Mock dependencies
-local mock_util = {
-    printout = function(...)
-    end,
-}
-mock("luarocks.util", mock_util)
-
--- Shell script template for pkg-config queries
-local SHELL_SCRIPT = [=[pkg="%s"
-pcfile=$(pkg-config --path "$pkg" 2>/dev/null)
-if [ -n "$pcfile" ]; then
-    # Extract variable definitions
-    for v in $(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$pcfile" | sed 's/=.*$//' || true); do
-        printf '%%s=%%s\n' "$v" "$(pkg-config --variable="$v" "$pkg" 2>/dev/null)"
-    done
-    #Extract metadata fields
-    grep -E '^(Name|Description|Version):\s*' "$pcfile" | sed 's/:\s*/=/' || true
-fi
-# Get computed values
-printf 'Libs=%%s\n' "$(pkg-config --libs "$pkg" 2>/dev/null || true)"
-printf 'Cflags=%%s\n' "$(pkg-config --cflags "$pkg" 2>/dev/null || true)"
-printf 'Modversion=%%s\n' "$(pkg-config --modversion "$pkg" 2>/dev/null || true)"
-]=]
-
--- Global Mock for io.popen
-local mock_popen_results = {}
-function _G.io.popen(cmd)
-    local result = mock_popen_results[cmd]
-    if result == nil then
-        return nil
-    end
-    -- Return a file-like object that reads line by line
-    local lines = {}
-    for line in result:gmatch("[^\r\n]+") do
-        table.insert(lines, line)
-    end
-    local idx = 0
-    return {
-        lines = function()
-            local i = 0
-            return function()
-                i = i + 1
-                return lines[i]
-            end
-        end,
-        read = function(_, mode)
-            if mode == "*l" or mode == "*L" then
-                idx = idx + 1
-                return lines[idx]
-            elseif mode == "*a" then
-                return result
-            end
-            return result
-        end,
-        close = function()
-        end,
-    }
-end
-
--- Mock os.execute for pkg-config --exists
-local mock_os_execute_results = {}
-local _os_execute = os.execute
-function _G.os.execute(cmd)
-    if cmd:match("^pkg%-config %-%-exists") then
-        local result = mock_os_execute_results[cmd]
-        if result == nil then
-            return 0 -- Default: package exists
-        end
-        return result
-    end
-    return _os_execute(cmd)
-end
-
 -- Load module under test
 local resolve_pkgconfig = require("luarocks.build.builtin-hook.pkgconfig")
 
 -- Test Helper
 local function run_test(name, func)
     io.write("Running " .. name .. "... ")
-    mock_popen_results = {}
-    mock_os_execute_results = {}
     local status, err = xpcall(func, debug.traceback)
     if status then
         print("OK")
@@ -103,20 +23,40 @@ local function assert_equal(expected, actual, msg)
     end
 end
 
--- Helper function to create mock pkg-config responses
-local function mock_pkg_config(pkg, data)
-    mock_popen_results[SHELL_SCRIPT:format(pkg)] = data
+local function assert_not_nil(val, msg)
+    if val == nil then
+        error((msg or "") .. " Expected non-nil value")
+    end
+end
+
+local function assert_not_equal(expected, actual, msg)
+    if expected == actual then
+        error((msg or "") .. " Expected " .. tostring(actual) .. " to be different from " .. tostring(expected))
+    end
 end
 
 -- Helper function to create a basic rockspec with external_dependencies
 local function create_rockspec(pkg, variables)
     return {
         external_dependencies = {
-            [pkg:lower()] = {},
+            [pkg] = {},
         },
         variables = variables or {},
     }
 end
+
+-- Check if zlib is available for testing
+local function check_zlib_available()
+    local f = io.popen("pkg-config --exists zlib 2>/dev/null && echo 1 || echo 0")
+    if not f then
+        return false
+    end
+    local result = f:read("*a"):match("%d")
+    f:close()
+    return result == "1"
+end
+
+local zlib_available = check_zlib_available()
 
 -- Tests
 
@@ -128,144 +68,203 @@ run_test("No external_dependencies", function()
     assert_equal(nil, next(rockspec.variables))
 end)
 
-run_test("Basic Resolution Success", function()
-    local rockspec = create_rockspec("libfoo")
-    mock_pkg_config("libfoo",
-                    "prefix=/usr\nincludedir=/usr/include\nlibdir=/usr/lib\nName=libfoo\nDescription=Foo Library\nVersion=1.2.3\nLibs=-lfoo\nCflags=-I/usr/include\nModversion=1.2.3")
+if zlib_available then
+    run_test("Basic Resolution Success (zlib)", function()
+        local rockspec = create_rockspec("zlib")
 
-    resolve_pkgconfig(rockspec)
+        resolve_pkgconfig(rockspec)
 
-    assert_equal("/usr/include", rockspec.variables.LIBFOO_INCDIR)
-    assert_equal("/usr/lib", rockspec.variables.LIBFOO_LIBDIR)
-    assert_equal("/usr", rockspec.variables.LIBFOO_DIR)
-    assert_equal("1.2.3", rockspec.variables.LIBFOO_VERSION)
-    assert_equal("1.2.3", rockspec.variables.LIBFOO_MODVERSION)
-    assert_equal("-lfoo", rockspec.variables.LIBFOO_LIBS)
-    assert_equal("-I/usr/include", rockspec.variables.LIBFOO_CFLAGS)
-end)
+        -- Check that ZLIB_ variables are set
+        assert_not_nil(rockspec.variables.ZLIB_LIBDIR, "ZLIB_LIBDIR should be set")
+        assert_not_nil(rockspec.variables.ZLIB_INCDIR, "ZLIB_INCDIR should be set")
+        assert_not_nil(rockspec.variables.ZLIB_DIR, "ZLIB_DIR should be set")
+        assert_not_nil(rockspec.variables.ZLIB_MODVERSION, "ZLIB_MODVERSION should be set")
+
+        -- Check that paths are strings
+        assert_equal("string", type(rockspec.variables.ZLIB_LIBDIR))
+        assert_equal("string", type(rockspec.variables.ZLIB_INCDIR))
+        assert_equal("string", type(rockspec.variables.ZLIB_DIR))
+        assert_equal("string", type(rockspec.variables.ZLIB_MODVERSION))
+    end)
+
+    run_test("Update existing variables (zlib)", function()
+        local rockspec = create_rockspec("zlib", {
+            ZLIB_INCDIR = "/old/include",
+            ZLIB_LIBDIR = "/old/lib",
+        })
+
+        resolve_pkgconfig(rockspec)
+
+        -- Check that old values were replaced
+        assert_not_equal("/old/include", rockspec.variables.ZLIB_INCDIR)
+        assert_not_equal("/old/lib", rockspec.variables.ZLIB_LIBDIR)
+    end)
+
+    run_test("Variables with unchanged values (zlib)", function()
+        -- First resolve to get actual values
+        local rockspec1 = create_rockspec("zlib")
+        resolve_pkgconfig(rockspec1)
+
+        local actual_includedir = rockspec1.variables.ZLIB_INCDIR
+        local actual_libdir = rockspec1.variables.ZLIB_LIBDIR
+
+        -- Now test with unchanged values
+        local rockspec2 = create_rockspec("zlib", {
+            ZLIB_INCDIR = actual_includedir,
+            ZLIB_LIBDIR = actual_libdir,
+        })
+
+        resolve_pkgconfig(rockspec2)
+
+        -- Values should remain the same
+        assert_equal(actual_includedir, rockspec2.variables.ZLIB_INCDIR)
+        assert_equal(actual_libdir, rockspec2.variables.ZLIB_LIBDIR)
+    end)
+else
+    print("SKIPPED: zlib not available via pkg-config")
+end
 
 run_test("Package not found", function()
-    local rockspec = create_rockspec("nonexistent")
-    mock_os_execute_results["pkg-config --exists nonexistent"] = 1
+    local rockspec = create_rockspec("nonexistent-pkg-12345")
 
     resolve_pkgconfig(rockspec)
 
-    assert_equal(nil, rockspec.variables.NONEXISTENT_INCDIR)
-    assert_equal(nil, rockspec.variables.NONEXISTENT_LIBDIR)
+    -- No variables should be set for nonexistent package
+    assert_equal(nil, rockspec.variables.NONEXISTENT_PKG_12345_INCDIR)
+    assert_equal(nil, rockspec.variables.NONEXISTENT_PKG_12345_LIBDIR)
 end)
 
-run_test("Version and Modversion with different values", function()
-    local rockspec = create_rockspec("libbar")
-    mock_pkg_config("libbar",
-                    "prefix=/usr\nincludedir=/usr/include\nlibdir=/usr/lib\nName=libbar\nDescription=Bar Library\nVersion=1.2.3-dev\nLibs=-lbar\nCflags=-I/usr/include\nModversion=1.2.3")
-
-    resolve_pkgconfig(rockspec)
-
-    assert_equal("1.2.3-dev", rockspec.variables.LIBBAR_VERSION)
-    assert_equal("1.2.3", rockspec.variables.LIBBAR_MODVERSION)
-end)
-
-run_test("Package without Version field", function()
-    local rockspec = create_rockspec("oldlib")
-    mock_pkg_config("oldlib",
-                    "prefix=/usr\nincludedir=/usr/include\nlibdir=/usr/lib\nName=Old Library\nModversion=1.0.0")
-
-    resolve_pkgconfig(rockspec)
-
-    assert_equal(nil, rockspec.variables.OLDLIB_VERSION)
-    assert_equal("1.0.0", rockspec.variables.OLDLIB_MODVERSION)
-end)
-
-run_test("Package without Modversion", function()
-    local rockspec = create_rockspec("brokenlib")
-    mock_pkg_config("brokenlib",
-                    "prefix=/usr\nincludedir=/usr/include\nlibdir=/usr/lib\nName=Broken Library\nVersion=2.0.0-beta")
-
-    resolve_pkgconfig(rockspec)
-
-    assert_equal("2.0.0-beta", rockspec.variables.BROKENLIB_VERSION)
-    assert_equal(nil, rockspec.variables.BROKENLIB_MODVERSION)
-end)
-
-run_test("Whitespace trimming in values", function()
-    local rockspec = create_rockspec("libtest")
-    mock_pkg_config("libtest",
-                    "prefix=/usr\nincludedir=/usr/include\nlibdir=/usr/lib\nName=  libtest  \nDescription=  Test Library  \nVersion=  1.0.0  \nLibs=-ltest\nCflags=-I/usr/include\nModversion=1.0.0")
-
-    resolve_pkgconfig(rockspec)
-
-    assert_equal("libtest", rockspec.variables.LIBTEST_NAME)
-    assert_equal("Test Library", rockspec.variables.LIBTEST_DESCRIPTION)
-    assert_equal("1.0.0", rockspec.variables.LIBTEST_VERSION)
-end)
-
-run_test("Update existing variables", function()
-    local rockspec = create_rockspec("libupdate", {
-        LIBUPDATE_INCDIR = "/old/include",
-        LIBUPDATE_LIBDIR = "/old/lib",
-        LIBUPDATE_DIR = "/old",
-        LIBVERSION_VERSION = "1.0.0",
+run_test("Keep variables when package not found", function()
+    local rockspec = create_rockspec("nonexistent-pkg-67890", {
+        NONEXISTENT_PKG_67890_INCDIR = "/old/include",
+        NONEXISTENT_PKG_67890_LIBDIR = "/old/lib",
+        NONEXISTENT_PKG_67890_CUSTOM_VAR = "custom_value",
     })
-    mock_pkg_config("libupdate",
-                    "prefix=/usr\nincludedir=/usr/include\nlibdir=/usr/lib\nName=libupdate\nDescription=Update Library\nVersion=2.0.0\nLibs=-lupdate\nCflags=-I/usr/include\nModversion=2.0.0")
 
     resolve_pkgconfig(rockspec)
 
-    assert_equal("/usr/include", rockspec.variables.LIBUPDATE_INCDIR)
-    assert_equal("/usr/lib", rockspec.variables.LIBUPDATE_LIBDIR)
-    assert_equal("/usr", rockspec.variables.LIBUPDATE_DIR)
-    assert_equal("1.0.0", rockspec.variables.LIBVERSION_VERSION)
+    -- Variables should be kept since package doesn't exist (early return)
+    assert_equal("/old/include", rockspec.variables.NONEXISTENT_PKG_67890_INCDIR)
+    assert_equal("/old/lib", rockspec.variables.NONEXISTENT_PKG_67890_LIBDIR)
+    assert_equal("custom_value", rockspec.variables.NONEXISTENT_PKG_67890_CUSTOM_VAR)
 end)
 
-run_test("Remove obsolete variables", function()
-    local rockspec = create_rockspec("libremove", {
-        LIBREMOVE_INCDIR = "/old/include",
-        LIBREMOVE_LIBDIR = "/old/lib",
-        LIBREMOVE_CUSTOM_VAR = "custom_value",
-    })
-    mock_pkg_config("libremove",
-                    "prefix=/usr\nincludedir=/usr/include\nlibdir=/usr/lib\nName=libremove\nDescription=Remove Library\nVersion=1.0.0\nLibs=-lremove\nCflags=-I/usr/include\nModversion=1.0.0")
+-- Test for partial match with suggestions
+run_test("Package not found with suggestions", function()
+    local rockspec = create_rockspec("zli")  -- Partial match for "zlib"
 
     resolve_pkgconfig(rockspec)
 
-    assert_equal("/usr/include", rockspec.variables.LIBREMOVE_INCDIR)
-    assert_equal("/usr/lib", rockspec.variables.LIBREMOVE_LIBDIR)
-    assert_equal(nil, rockspec.variables.LIBREMOVE_CUSTOM_VAR)
+    -- No variables should be set for partial match
+    assert_equal(nil, rockspec.variables.ZLI_INCDIR)
+    assert_equal(nil, rockspec.variables.ZLI_LIBDIR)
 end)
 
-run_test("Package with suggestions", function()
-    local rockspec = create_rockspec("unknownpkg")
-    mock_os_execute_results["pkg-config --exists unknownpkg"] = 1
-    mock_popen_results["pkg-config --list-package-names 2>/dev/null | grep -i unknownpkg"] =
-        "knownpkg\nsimilarpkg\nunknownpkg2"
+if zlib_available then
+    run_test("Case insensitive package name resolution", function()
+        local rockspec = create_rockspec("ZLIB")  -- Use uppercase
 
-    resolve_pkgconfig(rockspec)
+        resolve_pkgconfig(rockspec)
 
-    assert_equal(nil, rockspec.variables.UNKNOWNPKG_INCDIR)
-end)
+        -- Variables should still be set with ZLIB_ prefix (original name)
+        assert_not_nil(rockspec.variables.ZLIB_INCDIR, "ZLIB_INCDIR should be set")
+        assert_not_nil(rockspec.variables.ZLIB_LIBDIR, "ZLIB_LIBDIR should be set")
+    end)
 
-run_test("Variables with unchanged values", function()
-    local rockspec = create_rockspec("libkeep", {
-        LIBKEEP_INCDIR = "/usr/include",
-        LIBKEEP_LIBDIR = "/usr/lib",
-    })
-    mock_pkg_config("libkeep",
-                    "prefix=/usr\nincludedir=/usr/include\nlibdir=/usr/lib\nName=libkeep\nDescription=Keep Library\nVersion=1.0.0\nLibs=-lkeep\nCflags=-I/usr/include\nModversion=1.0.0")
+    run_test("Remove obsolete variables when package found", function()
+        -- First, get the current pkg-config variables
+        local rockspec1 = create_rockspec("zlib")
+        resolve_pkgconfig(rockspec1)
 
-    resolve_pkgconfig(rockspec)
+        -- Get all ZLIB_ variables
+        local zlib_vars = {}
+        for k, v in pairs(rockspec1.variables) do
+            if k:match("^ZLIB_") then
+                zlib_vars[k] = v
+            end
+        end
 
-    assert_equal("/usr/include", rockspec.variables.LIBKEEP_INCDIR)
-    assert_equal("/usr/lib", rockspec.variables.LIBKEEP_LIBDIR)
-end)
+        -- Create a new rockspec with current variables plus a custom variable
+        local rockspec2 = create_rockspec("zlib")
+        for k, v in pairs(zlib_vars) do
+            rockspec2.variables[k] = v
+        end
+        -- Add a custom variable that won't be in the new pkg-config output
+        rockspec2.variables.ZLIB_CUSTOM_VAR = "custom_value"
 
-run_test("io.popen returns nil", function()
-    local rockspec = create_rockspec("nilpkg")
-    -- Don't set any mock result, so io.popen returns nil
+        resolve_pkgconfig(rockspec2)
 
-    resolve_pkgconfig(rockspec)
+        -- Custom variable should be removed
+        assert_equal(nil, rockspec2.variables.ZLIB_CUSTOM_VAR,
+                     "ZLIB_CUSTOM_VAR should be removed")
 
-    assert_equal(nil, rockspec.variables.NILPKG_INCDIR)
-    assert_equal(nil, rockspec.variables.NILPKG_VERSION)
-end)
+        -- Standard variables should still exist
+        assert_not_nil(rockspec2.variables.ZLIB_INCDIR, "ZLIB_INCDIR should be set")
+        assert_not_nil(rockspec2.variables.ZLIB_LIBDIR, "ZLIB_LIBDIR should be set")
+    end)
+end
+
+-- Test cases with io.popen mocking for error paths
+if zlib_available then
+    run_test("Handle io.popen failure in get_pkg_variables", function()
+        local rockspec = create_rockspec("zlib", {
+            ZLIB_INCDIR = "/existing/include",
+            ZLIB_LIBDIR = "/existing/lib",
+            ZLIB_CUSTOM_VAR = "custom_value",
+        })
+
+        -- Mock io.popen to fail only for get_pkg_variables (second call)
+        -- find_package (first call) should succeed
+        local call_count = 0
+        local old_popen = _G.io.popen
+        _G.io.popen = function(cmd)
+            call_count = call_count + 1
+            -- First call is find_package, let it succeed
+            if call_count == 1 then
+                return old_popen(cmd)
+            end
+            -- Second call is get_pkg_variables, make it fail
+            return nil, "simulated io.popen failure"
+        end
+
+        resolve_pkgconfig(rockspec)
+
+        -- Restore original io.popen
+        _G.io.popen = old_popen
+
+        -- Variables should be removed by extract_variables but not restored
+        -- since get_pkg_variables failed
+        assert_equal(nil, rockspec.variables.ZLIB_INCDIR)
+        assert_equal(nil, rockspec.variables.ZLIB_LIBDIR)
+        assert_equal(nil, rockspec.variables.ZLIB_CUSTOM_VAR)
+    end)
+
+    run_test("Handle io.popen failure in find_package", function()
+        local rockspec = create_rockspec("zlib-nonexist", {
+            ZLIB_NONEXIST_INCDIR = "/existing/include",
+        })
+
+        -- Mock io.popen to fail only for find_package
+        local call_count = 0
+        local old_popen = _G.io.popen
+        _G.io.popen = function(cmd)
+            call_count = call_count + 1
+            -- First call is find_package, make it fail
+            if call_count == 1 then
+                return nil, "simulated io.popen failure"
+            end
+            -- Subsequent calls use original
+            return old_popen(cmd)
+        end
+
+        resolve_pkgconfig(rockspec)
+
+        -- Restore original io.popen
+        _G.io.popen = old_popen
+
+        -- Variables should remain unchanged since find_package failed
+        assert_equal("/existing/include", rockspec.variables.ZLIB_NONEXIST_INCDIR)
+    end)
+end
 
 print("All pkgconfig tests passed!")

@@ -23,29 +23,35 @@ local concat = table.concat
 local util = require("luarocks.util")
 
 --- Get all pkg-config variables and metadata for a given package
--- @param pkg Package name
--- @return Table with all variables and metadata fields
+--- @param pkg string name
+--- @return table? vars all variables and metadata fields
 local function get_pkg_variables(pkg)
-    local f = io.popen(([[
+    local f, err = io.popen(([[
 pkg="%s"
-pcfile=$(pkg-config --path "$pkg" 2>/dev/null)
-if [ -n "$pcfile" ]; then
+# Locate .pc file for the package
+pcdir=$(pkg-config --variable=pcfiledir "$pkg" 2>/dev/null)
+if [ -n "$pcdir" ]; then
+    # Construct full path to .pc file
+    pcfile="$pcdir/$pkg.pc"
+
     # Extract variable definitions
     for v in $(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$pcfile" | sed 's/=.*$//' || true); do
         printf '%%s=%%s\n' "$v" "$(pkg-config --variable="$v" "$pkg" 2>/dev/null)"
     done
-    #Extract metadata fields
+
+    # Extract metadata fields
     grep -E '^(Name|Description|Version):\s*' "$pcfile" | sed 's/:\s*/=/' || true
+
+    # Get computed values
+    printf 'Libs=%%s\n' "$(pkg-config --libs "$pkg" 2>/dev/null || true)"
+    printf 'Cflags=%%s\n' "$(pkg-config --cflags "$pkg" 2>/dev/null || true)"
+    printf 'Modversion=%%s\n' "$(pkg-config --modversion "$pkg" 2>/dev/null || true)"
 fi
-# Get computed values
-printf 'Libs=%%s\n' "$(pkg-config --libs "$pkg" 2>/dev/null || true)"
-printf 'Cflags=%%s\n' "$(pkg-config --cflags "$pkg" 2>/dev/null || true)"
-printf 'Modversion=%%s\n' "$(pkg-config --modversion "$pkg" 2>/dev/null || true)"
 ]]):format(pkg))
 
     local res = {}
     if not f then
-        return res
+        return nil, err
     end
 
     -- Parse all key=value pairs
@@ -107,32 +113,48 @@ local function update_variables(variables, new_vars, old_vars)
     end
 end
 
-local function pkg_exists(pkg)
-    local cmd = "pkg-config --exists " .. pkg
-    local res = os.execute(cmd)
-    return res == true or res == 0
-end
-
---- Suggest similar package names
--- @param pkg Package name to search for
--- @return Array of suggested package names
-local function suggest_packages(pkg)
-    local f = io.popen(
-                  ("pkg-config --list-package-names 2>/dev/null | grep -i %s"):format(
-                      pkg))
+--- Find package with case-insensitive exact match and get suggestions
+--- @param pkg string name to search for
+--- @return string? package name if found (case-insensitive), nil otherwise
+--- @return string[]? suggested package names (partial matches)
+local function find_package(pkg)
+    -- Use grep to filter packages, then awk to extract package names only
+    local f = io.popen(concat({
+        'pkg-config --list-all 2>/dev/null |',
+        ('grep -i %s |'):format(pkg),
+        "awk '{print $1}'",
+    }, ' '))
     if not f then
-        return {}
+        return
     end
 
     local suggestions = {}
     for line in f:lines() do
         local name = line:match("^%s*(%S+)%s*$")
         if name then
+            -- Exact case-sensitive match - return immediately
+            if name == pkg then
+                return name
+            end
+
+            -- Collect for suggestions (as array)
             suggestions[#suggestions + 1] = name
+
+            -- Build namelist for case-insensitive lookup (handle multiple packages with same lowercase name)
+            local lname = name:lower()
+            local namelist = suggestions[lname]
+            if not namelist then
+                namelist = {}
+                suggestions[lname] = namelist
+            end
+            namelist[#namelist + 1] = name
+
         end
     end
     f:close()
-    return suggestions
+
+    local namelist = suggestions[pkg:lower()]
+    return namelist and namelist[1] or nil, suggestions
 end
 
 local VAR_MAP = {
@@ -155,30 +177,43 @@ local function resolve_pkgconfig(rockspec)
     for name, _ in pairs(ext_deps) do
         util.printout(("  checking %s ..."):format(name))
 
-        if not pkg_exists(name) then
-            local suggestions = suggest_packages(name)
+        -- First, try to find exact case-insensitive match for better UX
+        local pkgname, suggestions = find_package(name)
+        if not pkgname then
             util.printout(("    %s is not registered in pkg-config."):format(
                               name))
-            if #suggestions > 0 then
+            if suggestions and #suggestions > 0 then
                 util.printout(("    Did you mean: %s?"):format(concat(
                                                                    suggestions,
-                                                                   ", ")))
+                                                                   ', ')))
             end
-        else
-            -- Identify and back up all existing variables with the prefix <NAME>_
-            local prefix = name:upper() .. "_"
-            local old_vars = extract_variables(rockspec.variables, prefix)
-            -- Fetch all pkg-config data
-            local pkg_data = get_pkg_variables(name)
-            -- Normalize variable names
-            local new_vars = {}
-            for varname, val in pairs(pkg_data) do
-                local suffix = VAR_MAP[varname] or varname:upper()
-                new_vars[prefix .. suffix] = val
-            end
-            -- Update variables and log changes
-            update_variables(rockspec.variables, new_vars, old_vars)
+            return
         end
+
+        -- Log resolved package name if different
+        if pkgname ~= name then
+            util.printout(("    resolved to %s"):format(pkgname))
+        end
+        name = pkgname
+
+        -- Identify and back up all existing variables with the prefix <NAME>_
+        local prefix = name:upper() .. "_"
+        local old_vars = extract_variables(rockspec.variables, prefix)
+        -- Fetch all pkg-config data
+        local pkg_data, err = get_pkg_variables(name)
+        if not pkg_data then
+            util.printout(("    failed to get pkg-config data: %s"):format(
+                              err or "unknown error"))
+            return
+        end
+        -- Normalize variable names
+        local new_vars = {}
+        for varname, val in pairs(pkg_data) do
+            local suffix = VAR_MAP[varname] or varname:upper()
+            new_vars[prefix .. suffix] = val
+        end
+        -- Update variables and log changes
+        update_variables(rockspec.variables, new_vars, old_vars)
     end
 end
 
