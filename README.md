@@ -6,6 +6,20 @@
 
 A custom build backend for LuaRocks that extends the standard `builtin` backend with support for executing Lua scripts before and after the build process.
 
+
+## Requirements
+
+- Lua 5.1 or later
+- LuaRocks 3.0 or later (recommended for `build_dependencies` support)
+
+
+## Installation
+
+```bash
+luarocks install luarocks-build-builtin-hook
+```
+
+
 ## Usage
 
 Utilize `build_dependencies` to ensure this backend is available during the build process, and specify `build.type = "builtin-hook"` in your rockspec.
@@ -25,7 +39,7 @@ build_dependencies = {
 
 build = {
    type = "builtin-hook",
-   
+
    -- Standard builtin modules definition
    modules = {
       ["my.module"] = "src/my/module.lua"
@@ -34,26 +48,87 @@ build = {
    -- Hook configuration
    -- before_build: Runs before the builtin build process starts
    before_build = "scripts/preprocess.lua",
-   
+
    -- after_build: Runs after the builtin build process finishes
    after_build = "scripts/cleanup.lua"
 }
+```
+
+### Multiple Hooks
+
+You can specify multiple hooks as an array. They will be executed in order.
+
+```lua
+build = {
+   type = "builtin-hook",
+
+   -- Multiple hooks executed in order
+   before_build = {
+      "scripts/generate_headers.lua",
+      "scripts/prepare_assets.lua",
+      "$(pkgconfig)",  -- Built-in hooks can also be used in arrays
+   },
+
+   after_build = {
+      "scripts/cleanup_temp.lua",
+      "scripts/postprocess.lua",
+   },
+}
+```
+
+
+### Hooks with Arguments
+
+You can pass arguments to hook scripts by adding them after the script path.
+
+```lua
+build = {
+   type = "builtin-hook",
+
+   -- Hook with arguments
+   before_build = "scripts/generate.lua --verbose --output=dist",
+
+   -- Built-in hook with arguments
+   after_build = "$(my-custom-hook) arg1 arg2",
+}
+```
+
+The hook script receives the `rockspec` as the first argument, followed by any additional arguments:
+
+```lua
+-- scripts/generate.lua
+local rockspec, verbose, output_option = ...
+
+if verbose == "--verbose" then
+   print("Verbose mode enabled")
+end
+
+-- Process arguments...
 ```
 
 
 ## Configuration Fields
 
 - `build.type`: Must be set to `"builtin-hook"`.
-- `build.before_build` (optional): Path to a Lua script to execute before the build.
-- `build.after_build` (optional): Path to a Lua script to execute after the build.
+- `build.before_build` (optional): Path to a Lua script to execute before the build, or an array of hook strings.
+- `build.after_build` (optional): Path to a Lua script to execute after the build, or an array of hook strings.
+
+**Hook String Format:**
+
+- `"<path>"` - Execute script at `<path>`
+- `"<path> <arg1> <arg2> ..."` - Execute script with arguments
+- `"$(hook_name)"` - Execute built-in hook
+- `"$(hook_name) <arg1> <arg2> ..."` - Execute built-in hook with arguments
 
 
 ## Hook Scripts
 
 Hooks must be Lua scripts. They are executed in a sandboxed environment within the same Lua VM.
-The `rockspec` table is passed as the first argument to the script, allowing you to modify the build configuration dynamically.
+
+The `rockspec` table is passed as the first argument to the script, followed by any additional arguments specified in the hook string.
 
 **Example `scripts/preprocess.lua`**:
+
 ```lua
 local rockspec = ...
 
@@ -155,11 +230,6 @@ build = {
 - If a package is not found, the hook will suggest similar package names based on `pkg-config --list-package-names`
 - All variables from the `.pc` file are made available, not just the standard ones
 
-
-## Requirements
-
-- Lua 5.1 or later
-- LuaRocks 3.0 or later (recommended for `build_dependencies` support)
 
 ## License
 
