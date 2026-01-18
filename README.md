@@ -198,8 +198,8 @@ For example, if you have `libfoo` in your `external_dependencies`, the hook will
 
 ```lua
 external_dependencies = {
-    -- Package name as used by pkg-config
-    LIBFOO = {}  
+    -- Package name as used by pkg-config (case-insensitive)
+    LIBFOO = {}
 }
 
 build = {
@@ -225,10 +225,98 @@ build = {
 ```
 
 **Notes:**
-- The package name in `external_dependencies` must match the `pkg-config` package name exactly
+
+- The package name in `external_dependencies` should match the `pkg-config` package name (case-insensitive)
 - Variable names are automatically uppercased (e.g., `libfoo` → `LIBFOO_*`)
-- If a package is not found, the hook will suggest similar package names based on `pkg-config --list-package-names`
+- If a package is not found, the hook will suggest similar package names based on `pkg-config --list-all`
 - All variables from the `.pc` file are made available, not just the standard ones
+
+
+### `$(extra-vars)` Built-in Hook
+
+The `extra-vars` hook allows you to append additional values to existing `rockspec.variables`. This is useful when you want to extend build variables (such as `CFLAGS`, `LIBFLAG`, etc.) with custom values without completely replacing them.
+
+**How it works:**
+
+1. Reads `build.extra_variables` from your rockspec
+2. For each entry, validates the value (string or array of strings)
+3. Appends the value to the corresponding variable in `rockspec.variables` if it exists and is a non-empty string
+4. Skips variables that don't exist, are not strings, or are empty
+
+**Usage Example:**
+
+```lua
+build = {
+    type = "builtin-hook",
+    before_build = "$(extra-vars)",
+
+    -- Define variables that will receive extra values
+    variables = {
+        CFLAGS = "-O2",
+        LIBFLAG = "-shared",
+    },
+
+    -- Extra values to append to existing variables
+    extra_variables = {
+        -- Append a single string
+        CFLAGS = "-Wall -Wextra",
+
+        -- Append an array of strings (joined with spaces)
+        LIBFLAG = {"-fPIC", "-static"},
+    },
+}
+```
+
+After the hook runs:
+
+- `rockspec.variables.CFLAGS` becomes `-O2 -Wall -Wextra`
+- `rockspec.variables.LIBFLAG` becomes `-shared -fPIC -static`
+
+**Value Types:**
+
+You can specify extra values as:
+
+- **String:** `CFLAGS = "-Wall"` → appends `-Wall`
+- **Array of strings:** `CFLAGS = {"-Wall", "-Wextra"}` → appends `-Wall -Wextra`
+
+**Behavior:**
+
+- Whitespace is automatically trimmed from values
+- Empty strings in arrays are filtered out
+- Only appends to existing **non-empty string** variables in `rockspec.variables`
+- Skips variables that:
+  - Don't exist in `rockspec.variables`
+  - Are not strings (e.g., numbers, tables)
+  - Are empty strings
+
+**Example with mixed results:**
+
+```lua
+variables = {
+    CFLAGS = "-O2",           -- Will be extended
+    LIBFLAG = "",             -- Empty: will be skipped
+    LDFLAGS = 123,            -- Not a string: will be skipped
+    -- NONEXISTENT is not defined: will be skipped
+}
+build = {
+    type = "builtin-hook",
+    before_build = "$(extra-vars)",
+    extra_variables = {
+        CFLAGS = "-Wall",         -- Appended: CFLAGS becomes "-O2 -Wall"
+        LIBFLAG = "-static",      -- Skipped (LIBFLAG is empty)
+        LDFLAGS = "-Wl,--as-needed",  -- Skipped (LDFLAGS is not a string)
+        NONEXISTENT = "--unused", -- Skipped (variable doesn't exist)
+    }
+    ...
+}
+```
+
+**Error Handling:**
+
+The hook will raise an error if:
+- `build.extra_variables` is not a table
+- A variable name in `extra_variables` is not a string
+- A value is neither a string nor an array of strings
 
 
 ## License
