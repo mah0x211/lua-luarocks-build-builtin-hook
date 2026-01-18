@@ -20,6 +20,7 @@ build = {
     type = "builtin",
     modules = {
         ["luarocks.build.builtin-hook"] = "lua/builtin-hook.lua",
+        ["luarocks.build.builtin-hook.extra-vars"] = "lua/hooks/extra-vars.lua",
         ["luarocks.build.builtin-hook.pkgconfig"] = "lua/hooks/pkgconfig.lua",
     },
 }
