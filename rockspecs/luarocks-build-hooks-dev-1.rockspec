@@ -22,5 +22,6 @@ build = {
         ["luarocks.build.hooks"] = "lua/hooks.lua",
         ["luarocks.build.hooks.extra-vars"] = "lua/hooks/extra-vars.lua",
         ["luarocks.build.hooks.pkgconfig"] = "lua/hooks/pkgconfig.lua",
+        ["luarocks.build.hooks.chdir"] = "src/chdir.c",
     },
 }

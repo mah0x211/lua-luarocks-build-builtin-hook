@@ -24,6 +24,7 @@ local unpack = unpack or table.unpack
 local builtin = require("luarocks.build.builtin")
 local fs = require("luarocks.fs")
 local util = require("luarocks.util")
+local chdir = require("luarocks.build.hooks.chdir")
 
 --- Create a shallow copy of a table, recursively copying any nested tables.
 local function copy_table(tbl, visited)
@@ -288,9 +289,17 @@ local function run_hooks(rockspec, no_install)
 end
 
 local function run(rockspec, no_install)
+    local target_dir = fs and fs.current_dir and fs.current_dir() or '.'
+    util.printout("Changing working directory to " .. target_dir)
+
+    local cwd = assert(chdir(target_dir))
     local ok, res, err = pcall(function()
         return run_hooks(rockspec, no_install)
     end)
+
+    util.printout("Restoring working directory to " .. cwd)
+    assert(chdir(cwd))
+
     if not ok then
         return nil, res
     end
