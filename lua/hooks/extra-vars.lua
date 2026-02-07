@@ -60,11 +60,11 @@ local function validate_value(value)
 end
 
 --- Get existing variable value
---- @param rockspec table rockspec table
+--- @param variables table variables table
 --- @param name string name
 --- @return string? var existing value or nil if not found
-local function get_variables(rockspec, name)
-    local var = rockspec.variables[name] or ''
+local function get_variables(variables, name)
+    local var = variables[name] or ''
     if type(var) ~= "string" then
         -- not a string
         return
@@ -77,38 +77,33 @@ local function get_variables(rockspec, name)
     end
 end
 
---- Append extra variables to rockspec.variables
---- @param rockspec table rockspec table
-local function append_extra_vars(rockspec)
-    local extra_vars = rockspec.build.extra_variables
-    if not extra_vars then
-        return
-    elseif type(extra_vars) ~= "table" then
-        error("hooks.extra-vars: build.extra_variables should be a table.")
-    end
-
-    util.printout("hooks.extra-vars: adding extra_variables...")
-    for name, value in pairs(extra_vars) do
+--- Append extra-variables to variables
+--- @param variables table variables table
+--- @param extvars table extra-variables table
+--- @param target string extra-variables table name
+local function append_vars(variables, extvars, target)
+    for name, value in pairs(extvars) do
         -- validate name
         if type(name) ~= "string" then
-            error(
-                ("  build.extra_variables[%q] variable-name must be a string"):format(
-                    tostring(name)))
+            error(("  %s[%q] variable-name must be a string"):format(target,
+                                                                     tostring(
+                                                                         name)))
         end
 
         -- validate value
         local err
         value, err = validate_value(value)
         if err then
-            error(("  build.extra_variables[%q] " .. err):format(tostring(name)))
+            error(("  %s[%q] " .. err):format(target, tostring(name)))
         end
 
         -- get existing variable
-        local var = get_variables(rockspec, name)
+        local var = get_variables(variables, name)
         if not var then
             util.printout(
-                ("  skipping %s: rockspec.variables.%s is not a string or empty"):format(
-                    name, name))
+                ("  skipping %s: %s.%s is not a string or empty"):format(name,
+                                                                         target,
+                                                                         name))
         elseif #value == 0 then
             -- skip empty value
             util.printout(("  skipping %s: extra value is empty"):format(name))
@@ -117,7 +112,56 @@ local function append_extra_vars(rockspec)
             util.printout(("  append %s values %q to existing value %q"):format(
                               name, value, var))
             var = var .. ' ' .. value
-            rockspec.variables[name] = var
+            variables[name] = var
+        end
+    end
+end
+
+-- Values considered as enabled for conditional_variables
+local ENABLED_VALUES = {
+    ['1'] = true,
+    ['true'] = true,
+}
+
+--- Append extra variables to rockspec.variables
+--- @param rockspec table rockspec table
+local function append_extra_vars(rockspec)
+    -- 1. Process extra_variables
+    local extra_vars = rockspec.build.extra_variables
+    if extra_vars then
+        if type(extra_vars) ~= "table" then
+            error("hooks.extra-vars: build.extra_variables should be a table.")
+        end
+        util.printout("hooks.extra-vars: adding extra_variables...")
+        append_vars(rockspec.variables, extra_vars, "build.extra_variables")
+    end
+
+    -- 2. Process conditional_variables
+    local cond_vars = rockspec.build.conditional_variables
+    if not cond_vars then
+        return
+    elseif type(cond_vars) ~= "table" then
+        error("hooks.extra-vars: build.conditional_variables should be a table.")
+    end
+    util.printout("hooks.extra-vars: processing conditional_variables...")
+
+    -- Iterate over conditional_variables
+    for flag, variables in pairs(cond_vars) do
+        if type(flag) ~= "string" then
+            error(
+                "hooks.extra-vars: conditional_variables flag name must be a string")
+        elseif type(variables) ~= "table" then
+            error(
+                ("hooks.extra-vars: conditional_variables[%q] must be a table"):format(
+                    flag))
+        end
+
+        -- Check if the flag is enabled in rockspec.variables
+        if ENABLED_VALUES[os.getenv(flag)] then
+            util.printout(
+                ("  [%s] enabled: appending variables..."):format(flag))
+            append_vars(rockspec.variables, variables,
+                        ("build.conditional_variables[%q]"):format(flag))
         end
     end
 end
