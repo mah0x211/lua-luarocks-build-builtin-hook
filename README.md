@@ -161,6 +161,21 @@ build = {
 
 The `pkgconfig` hook automatically resolves external dependencies using `pkg-config` and populates LuaRocks variables with the correct paths. This eliminates the need to manually specify include and library directories for external dependencies.
 
+**Compatibility:**
+
+The hook invokes `pkg-config` using the following options. All of these are supported by `pkgconf` with identical behavior, so the hook works transparently on systems where `pkg-config` is provided as a symlink to `pkgconf` (the default on Debian/Ubuntu and most modern Linux distributions):
+
+| Option | Purpose |
+|--------|---------|
+| `--variable=pcfiledir <pkg>` | Locate the directory containing the `.pc` file |
+| `--variable=<name> <pkg>` | Read an individual variable value from the `.pc` file |
+| `--libs <pkg>` | Get linker flags (e.g., `-L/path/lib -lfoo`) |
+| `--cflags <pkg>` | Get compiler flags (e.g., `-I/path/include`) |
+| `--modversion <pkg>` | Get the package module version |
+| `--list-all` | Enumerate all packages known to `pkg-config` |
+
+If only `pkgconf` is installed without a `pkg-config` symlink, the hook will fail to find the command. In that case, create the symlink manually or install the `pkg-config` compatibility package for your distribution.
+
 **How it works:**
 
 1. Reads package information from the `.pc` files via `pkg-config`
@@ -180,6 +195,7 @@ The hook maps `pkg-config` variables and metadata to LuaRocks variables as follo
 - Modversion (from `--modversion`) → `<PACKAGE>_MODVERSION`
 - Libs (from `--libs`) → `<PACKAGE>_LIBS`
 - Cflags (from `--cflags`) → `<PACKAGE>_CFLAGS`
+- Library names (from `--libs`, without `-l` prefix, space-separated) → `<PACKAGE>_LIB`
 
 For example, if you have `libfoo` in your `external_dependencies`, the hook will create variables like:
 
@@ -189,16 +205,44 @@ For example, if you have `libfoo` in your `external_dependencies`, the hook will
 - `LIBFOO_VERSION` (from Version: field in .pc file)
 - `LIBFOO_MODVERSION` (from --modversion)
 - `LIBFOO_LIBS` (e.g., `-lfoo`)
+- `LIBFOO_LIB` (e.g., `foo`)
 - `LIBFOO_CFLAGS` (e.g., `-I/path/to/include`)
 - `LIBFOO_EXEC_PREFIX`
 - etc.
 
+**Hyphen and Dot Normalization:**
+
+LuaRocks variable substitution (`$(NAME)`) only recognizes names that start with a letter and contain only letters, digits, and underscores. However, `external_dependencies` key names must match `pkg-config` package names, which can contain hyphens and dots (e.g., `foo-2.0`).
+
+To bridge this gap, the hook normalizes all characters that are not letters, digits, or underscores to underscores when generating LuaRocks variable names.
+
+For example, `foo-2.0` in `external_dependencies` produces:
+
+- `FOO_2_0_INCDIR` (not `FOO-2.0_INCDIR`)
+- `FOO_2_0_LIBDIR`
+- `FOO_2_0_LIB`
+- etc.
+
+Use the normalized form when referencing these variables in your rockspec (e.g., `$(FOO_2_0_INCDIR)`).
+
+**Using `$(PACKAGE_LIB)` in the `libraries` field:**
+
+The `<PACKAGE>_LIB` variable contains the library names extracted from `pkg-config --libs`, without the `-l` prefix and without linker flags like `-L`. This lets you use `$(PACKAGE_LIB)` directly in the `libraries` field.
+
+For packages with a **single library**, the hook leaves `$(PACKAGE_LIB)` as-is. LuaRocks substitutes the variable and prepends `-l` automatically, so `"$(FOO_LIB)"` becomes `-lfoo` at compile time.
+
+For packages with **multiple libraries** (e.g., `bar` provides `-lbar -lbaz`), the hook **expands** the `libraries` entry before `builtin.run()` processes it. A single `"$(BAR_LIB)"` entry is replaced with individual library name strings `{"bar", "baz"}`, which LuaRocks then maps to `-lbar -lbaz`.
+
+> **Note:** Embedding `$(PACKAGE_LIB)` inside a larger string (e.g., `"extra_$(BAR_LIB)"`) raises an error when the package provides multiple libraries, since the expansion cannot be represented as a single library name.
+
 **Usage Example:**
 
 ```lua
+-- pkg-config --libs bar  →  -L/usr/lib -lbar -lbaz
+-- Hook sets: BAR_LIB = "bar baz",  BAR_LIBS = "-L/usr/lib -lbar -lbaz"
+
 external_dependencies = {
-    -- Package name as used by pkg-config (case-insensitive)
-    LIBFOO = {}
+    bar = {},   -- pkg-config package name (case-insensitive)
 }
 
 build = {
@@ -206,27 +250,25 @@ build = {
     before_build = "$(pkgconfig)",
     modules = {
         mymodule = {
-            sources = {
-                "src/mymodule.c",
-            },
-            libraries = {
-                "foo",
-            },
-            incdirs = {
-                "$(LIBFOO_INCDIR)",  -- Automatically populated by pkgconfig hook
-            },
-            libdirs = {
-                "$(LIBFOO_LIBDIR)",  -- Automatically populated by pkgconfig hook
-            },
+            sources  = {"src/mymodule.c"},
+            libraries = {"$(BAR_LIB)"},     -- hook expands to {"bar", "baz"}
+            incdirs  = {"$(BAR_INCDIR)"},   -- populated by hook
+            libdirs  = {"$(BAR_LIBDIR)"},   -- populated by hook
         },
     }
 }
+
+-- After the hook runs, builtin.run() sees:
+--   libraries = {"bar", "baz"}   →  -lbar -lbaz
+--   incdirs   = {"/usr/include"}
+--   libdirs   = {"/usr/lib"}
 ```
 
 **Notes:**
 
 - The package name in `external_dependencies` should match the `pkg-config` package name (case-insensitive)
-- Variable names are automatically uppercased (e.g., `libfoo` → `LIBFOO_*`)
+- Variable names are automatically uppercased and any character that is not a letter, digit, or underscore is replaced with an underscore (e.g., `foo-2.0` → `FOO_2_0_*`). This is required because LuaRocks `$(NAME)` substitution only accepts `[A-Za-z0-9_]`.
+- If a package is not found in `pkg-config`, the hook logs a warning and continues processing remaining dependencies
 - If a package is not found, the hook will suggest similar package names based on `pkg-config --list-all`
 - All variables from the `.pc` file are made available, not just the standard ones
 
