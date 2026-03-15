@@ -1,7 +1,7 @@
 std = "max"
 include_files = {
-    "lua/*.lua",
-    "test/*.lua",
+    "lua/**/*.lua",
+    "test/**/*.lua",
 }
 ignore = {
     -- unused argument

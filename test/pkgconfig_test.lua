@@ -304,4 +304,275 @@ if zlib_available then
     end)
 end
 
+if zlib_available then
+    run_test("*_LIB variable is set for single-library package (zlib)",
+             function()
+        local rockspec = create_rockspec("zlib")
+        resolve_pkgconfig(rockspec)
+
+        -- ZLIB_LIB should be a string (at least one library name)
+        assert_not_nil(rockspec.variables.ZLIB_LIB, "ZLIB_LIB should be set")
+        assert_equal("string", type(rockspec.variables.ZLIB_LIB))
+    end)
+
+    run_test("Single-lib $(VAR_LIB) in libraries is not expanded by hook",
+             function()
+        local rockspec = {
+            external_dependencies = {
+                zlib = {},
+            },
+            variables = {},
+            build = {
+                modules = {
+                    mymod = {
+                        libraries = {
+                            "$(ZLIB_LIB)",
+                        },
+                    },
+                },
+            },
+        }
+        resolve_pkgconfig(rockspec)
+
+        -- For a single-lib package, the entry should remain as $(ZLIB_LIB)
+        -- so LuaRocks can do native variable substitution
+        assert_equal("$(ZLIB_LIB)", rockspec.build.modules.mymod.libraries[1])
+        assert_equal(1, #rockspec.build.modules.mymod.libraries)
+    end)
+end
+
+-- Helper to create a mock file handle from multi-line string content
+local function make_fake_file(content)
+    local lines = {}
+    for line in content:gmatch('[^\n]+') do
+        lines[#lines + 1] = line
+    end
+    local i = 0
+    return {
+        lines = function()
+            return function()
+                i = i + 1
+                return lines[i]
+            end
+        end,
+        close = function()
+        end,
+    }
+end
+
+run_test("Multi-lib $(VAR_LIB) entry in libraries is expanded", function()
+    local rockspec = {
+        external_dependencies = {
+            MYLIB = {},
+        },
+        variables = {},
+        build = {
+            modules = {
+                mymod = {
+                    libraries = {
+                        "$(MYLIB_LIB)",
+                    },
+                },
+            },
+        },
+    }
+
+    local call_count = 0
+    local old_popen = _G.io.popen
+    _G.io.popen = function(cmd)
+        call_count = call_count + 1
+        if call_count == 1 then
+            -- find_package: exact match
+            return make_fake_file("MYLIB\n")
+        end
+        -- get_pkg_variables: two -l flags
+        return make_fake_file(
+                   "prefix=/path\n" .. "includedir=/path/include\n" ..
+                       "libdir=/path/lib\n" .. "Name=MYLIB\n" .. "Version=1.0\n" ..
+                       "Libs=-L/path/lib -lssl -lcrypto\n" ..
+                       "Cflags=-I/path/include\n" .. "Modversion=1.0\n")
+    end
+
+    resolve_pkgconfig(rockspec)
+    _G.io.popen = old_popen
+
+    -- *_LIB variable should contain all library names space-separated
+    assert_equal("ssl crypto", rockspec.variables.MYLIB_LIB,
+                 "MYLIB_LIB should contain all library names")
+
+    -- libraries should be expanded into individual entries
+    assert_equal(2, #rockspec.build.modules.mymod.libraries,
+                 "libraries should have 2 entries after expansion")
+    assert_equal("ssl", rockspec.build.modules.mymod.libraries[1])
+    assert_equal("crypto", rockspec.build.modules.mymod.libraries[2])
+end)
+
+run_test(
+    "Multi-lib $(VAR_LIB) with surrounding whitespace in libraries is expanded",
+    function()
+        local rockspec = {
+            external_dependencies = {
+                MYLIB = {},
+            },
+            variables = {},
+            build = {
+                modules = {
+                    mymod = {
+                        libraries = {
+                            "  $(MYLIB_LIB)  ",
+                        },
+                    },
+                },
+            },
+        }
+
+        local call_count = 0
+        local old_popen = _G.io.popen
+        _G.io.popen = function(cmd)
+            call_count = call_count + 1
+            if call_count == 1 then
+                return make_fake_file("MYLIB\n")
+            end
+            return make_fake_file("prefix=/path\n" ..
+                                      "includedir=/path/include\n" ..
+                                      "libdir=/path/lib\n" .. "Name=MYLIB\n" ..
+                                      "Version=1.0\n" ..
+                                      "Libs=-L/path/lib -lssl -lcrypto\n" ..
+                                      "Cflags=-I/path/include\n" ..
+                                      "Modversion=1.0\n")
+        end
+
+        resolve_pkgconfig(rockspec)
+        _G.io.popen = old_popen
+
+        -- surrounding whitespace is ignored: entry expands to multiple entries
+        assert_equal(2, #rockspec.build.modules.mymod.libraries)
+        assert_equal("ssl", rockspec.build.modules.mymod.libraries[1])
+        assert_equal("crypto", rockspec.build.modules.mymod.libraries[2])
+    end)
+
+run_test("Multi-lib $(VAR_LIB) embedded in library entry raises error",
+         function()
+    local rockspec = {
+        external_dependencies = {
+            MYLIB = {},
+        },
+        variables = {},
+        build = {
+            modules = {
+                mymod = {
+                    libraries = {
+                        "extra_$(MYLIB_LIB)",
+                    },
+                },
+            },
+        },
+    }
+
+    local call_count = 0
+    local old_popen = _G.io.popen
+    _G.io.popen = function(cmd)
+        call_count = call_count + 1
+        if call_count == 1 then
+            return make_fake_file("MYLIB\n")
+        end
+        return make_fake_file("prefix=/path\n" ..
+                                  "Libs=-L/path/lib -lssl -lcrypto\n")
+    end
+
+    local ok, err = pcall(resolve_pkgconfig, rockspec)
+    _G.io.popen = old_popen
+
+    assert_equal(false, ok,
+                 "should raise an error for embedded multi-lib reference")
+    assert_not_nil(err:find("$(MYLIB_LIB)", 1, true),
+                   "error message should mention the variable reference")
+end)
+
+run_test("Multi-lib $(VAR_LIB) as string libraries is converted to array",
+         function()
+    local rockspec = {
+        external_dependencies = {
+            MYLIB = {},
+        },
+        variables = {},
+        build = {
+            modules = {
+                mymod = {
+                    libraries = "  $(MYLIB_LIB)  ",
+                },
+            },
+        },
+    }
+
+    local call_count = 0
+    local old_popen = _G.io.popen
+    _G.io.popen = function(cmd)
+        call_count = call_count + 1
+        if call_count == 1 then
+            return make_fake_file("MYLIB\n")
+        end
+        return make_fake_file(
+                   "prefix=/path\n" .. "includedir=/path/include\n" ..
+                       "libdir=/path/lib\n" .. "Name=MYLIB\n" .. "Version=1.0\n" ..
+                       "Libs=-L/path/lib -lssl -lcrypto\n" ..
+                       "Cflags=-I/path/include\n" .. "Modversion=1.0\n")
+    end
+
+    resolve_pkgconfig(rockspec)
+    _G.io.popen = old_popen
+
+    -- string libraries matching the pattern (with whitespace) should be converted to an array
+    assert_equal("table", type(rockspec.build.modules.mymod.libraries))
+    assert_equal(2, #rockspec.build.modules.mymod.libraries)
+    assert_equal("ssl", rockspec.build.modules.mymod.libraries[1])
+    assert_equal("crypto", rockspec.build.modules.mymod.libraries[2])
+end)
+
+run_test(
+    "Package name with hyphens and dots produces normalized variable names",
+    function()
+        local rockspec = {
+            external_dependencies = {
+                ["foo-2.0"] = {},
+            },
+            variables = {},
+            build = {
+                modules = {},
+            },
+        }
+
+        local call_count = 0
+        local old_popen = _G.io.popen
+        _G.io.popen = function(cmd)
+            call_count = call_count + 1
+            if call_count == 1 then
+                return make_fake_file("foo-2.0\n")
+            end
+            return make_fake_file("prefix=/path\n" ..
+                                      "includedir=/path/include\n" ..
+                                      "libdir=/path/lib\n" .. "Name=foo-2.0\n" ..
+                                      "Version=2.0\n" ..
+                                      "Libs=-L/path/lib -lfoo\n" ..
+                                      "Cflags=-I/path/include\n" ..
+                                      "Modversion=2.0\n")
+        end
+
+        resolve_pkgconfig(rockspec)
+        _G.io.popen = old_popen
+
+        -- Hyphens and dots must be replaced with underscores for LuaRocks $(VAR) substitution
+        assert_not_nil(rockspec.variables["FOO_2_0_INCDIR"],
+                       "FOO_2_0_INCDIR should be set")
+        assert_not_nil(rockspec.variables["FOO_2_0_LIBDIR"],
+                       "FOO_2_0_LIBDIR should be set")
+        assert_not_nil(rockspec.variables["FOO_2_0_LIB"],
+                       "FOO_2_0_LIB should be set")
+        -- Dot-containing names must NOT appear as variable keys
+        for k in pairs(rockspec.variables) do
+            assert(not k:find("[^%a%d_]"),
+                   "variable key contains invalid character: " .. k)
+        end
+    end)
+
 print("All pkgconfig tests passed!")

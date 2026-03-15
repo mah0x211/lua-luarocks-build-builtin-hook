@@ -79,6 +79,16 @@ fi
     return res
 end
 
+--- Normalize a string to a valid LuaRocks variable name.
+--- LuaRocks variable substitution $(NAME) only recognizes names starting with
+--- a letter and containing only letters, digits, and underscores. This function
+--- replaces any other character with an underscore.
+--- @param s string
+--- @return string
+local function normalize_varname(s)
+    return s:gsub("[^%a%d_]", "_")
+end
+
 local function extract_variables(variables, prefix)
     local extracted = {}
     for k, v in pairs(variables) do
@@ -93,19 +103,13 @@ end
 local function update_variables(variables, new_vars, old_vars)
     -- Log added and updated variables
     for k, v in pairs(new_vars) do
-        -- Note: Replace hyphens with underscores in variable names.
-        -- luarocks cannot process variable names containing hyphens, but
-        -- pkg-config packages may contain hyphens. This normalization ensures
-        -- compatibility.
-        local newk = k:gsub("-", "_")
+        local newk = normalize_varname(k)
         local old_val = old_vars[k]
-        local msg = ""
+        local msg = ("    kept %s = %s"):format(newk, v)
         if not old_val then
             msg = ("    added %s = %s"):format(newk, v)
         elseif old_val ~= v then
             msg = ("    updated %s = %s (replaced %s)"):format(newk, v, old_val)
-        else
-            msg = ("    kept %s = %s"):format(newk, v)
         end
         util.printout(msg)
         old_vars[k] = nil
@@ -169,6 +173,82 @@ local VAR_MAP = {
     bindir = "BINDIR",
 }
 
+--- Process a libraries array, expanding any standalone $(VAR_NAME) entries into
+--- individual library names. Raises an error if the reference is embedded within
+--- a larger string. Returns the original table if no expansion was needed.
+--- @param libs string[] The libraries array to process
+--- @param lib_names string[] Library names to expand into
+--- @param var_name string The normalized *_LIB variable name (e.g. "OPENSSL_LIB")
+--- @return string[] The processed libraries array (new table if expanded)
+local function expand_libraries(libs, lib_names, var_name)
+    local var_pat = '%$%(' .. var_name .. '%)'
+    local var_ref = ('$(%s)'):format(var_name)
+    local new_libs = {}
+    local changed = false
+    for _, entry in ipairs(libs) do
+        if entry:find(var_pat) then
+            local remainder = entry:gsub(var_pat, "")
+            if remainder:match('%S') then
+                error(("%s resolves to multiple libraries and cannot " ..
+                          "be embedded in a library entry: %q"):format(var_ref,
+                                                                       entry))
+            end
+            changed = true
+        else
+            new_libs[#new_libs + 1] = entry
+        end
+    end
+
+    -- No entries contained the variable reference, so no expansion needed.
+    if not changed then
+        return libs
+    end
+
+    -- Expand the variable reference into individual library names.
+    for _, lib in ipairs(lib_names) do
+        new_libs[#new_libs + 1] = lib
+    end
+    return new_libs
+end
+
+--- Expand multi-lib $(VAR_LIB) entries in rockspec.build.modules.*.libraries.
+--- Only expands when lib_names contains more than one library name.
+--- Single-lib entries are left as-is for LuaRocks to substitute natively.
+--- Raises an error if the variable reference is embedded within a larger string,
+--- since a multi-lib variable cannot be meaningfully embedded.
+--- @param rockspec table The rockspec table
+--- @param var_name string The normalized *_LIB variable name (e.g. "OPENSSL_LIB")
+--- @param lib_names string[] Library names extracted from Libs (empty = no-op)
+local function expand_lib_vars(rockspec, var_name, lib_names)
+    if #lib_names < 2 then
+        return
+    end
+
+    local modules = rockspec.build and rockspec.build.modules
+    if type(modules) ~= 'table' then
+        return
+    end
+
+    for _, mod in pairs(modules) do
+        if type(mod) == 'table' then
+            local libs = mod.libraries
+            if type(libs) == 'string' then
+                -- Single string entry - convert to table for uniform processing.
+                libs = {
+                    libs,
+                }
+            end
+
+            if type(libs) == 'table' then
+                local result = expand_libraries(libs, lib_names, var_name)
+                if result ~= libs then
+                    mod.libraries = result
+                end
+            end
+        end
+    end
+end
+
 --- Resolve a single external dependency using pkg-config
 --- @param rockspec table The rockspec table
 --- @param name string The dependency name from external_dependencies
@@ -199,8 +279,12 @@ local function resolve_one(rockspec, name)
         return
     end
 
-    -- Back up and remove all existing variables with the prefix <NAME>_
-    local prefix = name:upper() .. "_"
+    -- Back up and remove all existing variables with the prefix <NAME>_.
+    -- Normalize the prefix so it matches the stored variable keys:
+    -- Normalize the prefix so it matches the stored variable keys.
+    -- LuaRocks only allows [%a%d_] in $(NAME), so any other character (hyphens,
+    -- dots, etc.) in the package name is replaced with underscores.
+    local prefix = normalize_varname(name:upper() .. "_")
     local old_vars = extract_variables(rockspec.variables, prefix)
     -- Normalize variable names
     local new_vars = {}
@@ -208,8 +292,24 @@ local function resolve_one(rockspec, name)
         local suffix = VAR_MAP[varname] or varname:upper()
         new_vars[prefix .. suffix] = val
     end
+
+    -- Synthesize *_LIB: all library names from Libs, space-separated (no -l prefix).
+    -- This enables libraries = { "$(PREFIX_LIB)" } in rockspecs.
+    local lib_names = {}
+    if pkg_data.Libs then
+        for lib in pkg_data.Libs:gmatch('%-l(%S+)') do
+            lib_names[#lib_names + 1] = lib
+        end
+        if #lib_names > 0 then
+            new_vars[prefix .. "LIB"] = concat(lib_names, ' ')
+        end
+    end
     -- Update variables and log changes
     update_variables(rockspec.variables, new_vars, old_vars)
+
+    -- prefix is already normalized; just append "LIB".
+    local lib_key = prefix .. "LIB"
+    expand_lib_vars(rockspec, lib_key, lib_names)
 end
 
 --- Resolve dependencies using pkg-config
